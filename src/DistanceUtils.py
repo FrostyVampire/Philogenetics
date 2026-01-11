@@ -1,4 +1,5 @@
 # All the distance calculation functions
+import itertools
 
 import numpy as np
 import parasail
@@ -6,6 +7,8 @@ import zlib
 import concurrent.futures
 from multiprocessing import Pool
 from Levenshtein import distance
+
+k = 3   # The k used by k-mers
 
 # Calculate Smith-Waterman distance between two sequences.
 def calculateSwDistance(args):
@@ -23,9 +26,7 @@ def calculateSwDistance(args):
     return 1.0 - (score / maxPossibleScore)
 
 # Create a distance matrix parallel
-def createDistanceMatrixParallel(originalGenes, inheritedGenes,
-                                 matchScore=2, mismatchPenalty=-1,
-                                 gapOpen=1, gapExtend=1, processes=None):
+def createDistanceMatrixParallel(originalGenes, inheritedGenes,matchScore=2, mismatchPenalty=-1, gapOpen=1, gapExtend=1, processes=None):
     pairs = [
         (originalGenes[i], inheritedGenes[j],
          matchScore, mismatchPenalty, gapOpen, gapExtend)
@@ -58,12 +59,11 @@ def smithWatermanDistance(genome1, genome2):
 
     return smithWatermanDists
 
-
 def klDivergence(p, q):
     return np.sum(np.where(p != 0, p * np.log(p / q), 0))
 
-# Levenshtein
-def distLev2(genome1, genome2):
+# Levenshtein distance between 2 given genomes
+def levenshteinDistance(genome1, genome2):
     epsilon = 1e-6
     levensteinDistances = np.zeros((genome1.genesNumber, genome2.genesNumber))
     for i in range(genome1.genesNumber):
@@ -91,74 +91,62 @@ def createNCDMatrix(genome1, genome2):
             z12 = len(zlib.compress(seq1 + seq2))
             z21 = len(zlib.compress(seq2 + seq1))
 
-            ncdDistances[i][j] = epsilon + ((z12 + z21 - (z11 + z22)) / (z12 + z21))
+            # ncdDistances[i][j] = epsilon + ((z12 + z21 - (z11 + z22)) / (z12 + z21))
+            ncdDistances[i][j] = epsilon + ((z12+z21-2*min(z1,z2)) / 2*max(z1,z2))
             ncdMeans[i][j] = (z12 + z21) / 2.0
 
     return ncdDistances, ncdMeans
 
+# Initiate the dictionary for k-mers of a given length (e.g. AGCT with length 3 will generate all possibilities AAA, AAC,..., TTT)
+def initiateKMerDictionary(base, length):
+    return {''.join(p): 0 for p in itertools.product(base, repeat=length)}
 
-def initiateTripletDictionary(base):
-    dictionary = {}
-    triplet = ""
-    for i in range(len(base)):
-        triplet += base[i]
-        for j in range(len(base)):
-            triplet += base[j]
-            for k in range(len(base)):
-                triplet = triplet[0:2]
-                triplet += base[k]
-                dictionary[str(triplet)] = 0
-            triplet = triplet[0:1]
-        triplet = ""
-    return dictionary
-
-
-def createTripletDictionary(dictionary, gene):
+# Count how often each sequence of length k occurs in the gene and normalize to get frequencies
+def computeKMerFrequencies(dictionary, gene, length):
     """
-   Count how often each triplet (3-character sequence) occurs in the gene and normalize to get frequencies.
-
    Args:
-       Dictionary mapping triplets to counts (initially 0)
-       Gene object with a 'seq' attribute containing the sequence
-
+        dictionary (dict): mapping k-mers to counts (initially 0)
+        gene: object with a 'seq' attribute containing the sequence
+        length (int): size of the k-mers (e.g., 3 for triplets)
    Returns:
-       dict: updated dictionary mapping triplets to their normalized frequencies
+       dict: updated dictionary mapping k-mers to their normalized frequencies
     """
-    for i in range(len(gene.seq) - 2):
-        str1 = str(gene.seq[i: i + 3])
-        dictionary[str1] += 1
-    for key in dictionary.keys():
-        dictionary[key] = dictionary[key] / (len(gene.data) - 2)
+    seq = gene.seq
+    for i in range(len(seq) - length + 1):
+        kmer = seq[i: i + length]
+        dictionary[kmer] += 1
+
+    total = len(seq) - length + 1
+    for key in dictionary:
+        dictionary[key] /= total
     return dictionary
 
+# Computes the Hellinger distances between all genes of two genomes using k-mers
 def hellinger(genome1, genome2, base):
     """
-    Computes the Hellinger distances between all genes of two genomes.
-
     Args:
-        2 genomes
-        baseTriplets: list of all possible triplets used to initialize dictionaries
-
+        genome1, genome2: genome objects, each with .genes (list) and .genesNumber
+        base (list[str]): alphabet of valid bases (e.g. ["A","C","G","T"])
     Returns:
-        numpy.ndarray: matrix of Hellinger distances between genes of genome1 and genome2
+        np.ndarray: matrix of Hellinger distances between genes of genome1 and genome2
     """
     epsilon = 1e-6
-    baseTripletDictionary = initiateTripletDictionary(base)
+    baseKMerDict = initiateKMerDictionary(base, k)
     hellingerDistances = np.zeros((genome1.genesNumber, genome2.genesNumber))
 
     try:
-        for i in range(len(genome1.genes)):
-            tripletDict1 = createTripletDictionary(baseTripletDictionary.copy(), genome1.genes[i])
+        for i in range(genome1.genesNumber):
+            kmerDict1 = computeKMerFrequencies(baseKMerDict.copy(), genome1.genes[i], k)
             for j in range(genome2.genesNumber):
-                tripletDict2 = createTripletDictionary(baseTripletDictionary.copy(), genome2.genes[j])
+                kmerDict2 = computeKMerFrequencies(baseKMerDict.copy(), genome2.genes[j], k)
                 distanceSum = epsilon
-                for triplet in tripletDict1.keys():
-                    diffSquared = (np.sqrt(tripletDict1[triplet]) - np.sqrt(tripletDict2[triplet])) ** 2
+                for kmer in kmerDict1:
+                    diffSquared = (np.sqrt(kmerDict1[kmer]) - np.sqrt(kmerDict2[kmer])) ** 2
                     distanceSum += diffSquared
                 hellingerDistances[i][j] = np.sqrt(distanceSum) / np.sqrt(2.0)
         return hellingerDistances
     except Exception as e:
-        print(f"Hellinger distance exception at gene pair ({i}, {j}):",e)
+        print(f"Hellinger distance exception at gene pair ({i}, {j}): {e}")
         exit()
 
 # Run a function with timeout, return None if it fails.
@@ -173,3 +161,65 @@ def runWithTimeout(func, timeoutSeconds, *args, **kwargs):
         except Exception as e:
             print("runWithTimeout exception:", e)
             return None
+
+def calculateLempelZivDistance(seq1, seq2):
+    """
+    Compute the Lempel–Ziv distance between two sequences.
+    This version is adapted from the prototype, cleaned up.
+    """
+    s1, s2 = "".join(map(str, seq1)), "".join(map(str, seq2))
+    concat = s1 + s2
+
+    c1 = lempelZivComplexity(s1)
+    c2 = lempelZivComplexity(s2)
+    c12 = lempelZivComplexity(concat)
+
+    return (c12 - min(c1, c2)) / max(c1, c2)
+
+# Compute Lempel-Ziv complexity (number of distinct substrings found sequentially).
+def lempelZivComplexity(seq: str) -> int:
+    i, k, l, n = 0, 1, 1, len(seq)
+    c = 1
+    while True:
+        if i + k == n or seq[i + k] != seq[l + k]:
+            if k > l:
+                l = k
+            i += 1
+            if i == l:
+                c += 1
+                l = 1
+                i = 0
+                if l + 1 > n:
+                    break
+            k = 1
+        else:
+            k += 1
+            if l + k > n:
+                c += 1
+                break
+    return c
+
+# Create distance matrix based on Lempel-Ziv complexity difference.
+def createLZMatrix(genome1, genome2):
+    epsilon = 1e-6
+    lzDistances = np.zeros((genome1.genesNumber, genome2.genesNumber))
+    for i in range(genome1.genesNumber):
+        for j in range(genome2.genesNumber):
+            g1 = str(genome1.genes[i].seq)
+            g2 = str(genome2.genes[j].seq)
+            c1, c2 = lempelZivComplexity(g1), lempelZivComplexity(g2)
+            c12 = lempelZivComplexity(g1 + g2)
+            lzDistances[i][j] = epsilon + (c12 - min(c1, c2)) / max(c1, c2)
+    return lzDistances
+
+# Compute the synteny index between two genomes.
+def syntenyIndex(genome1, genome2):
+    # SI = (2 * common genes) / (len(genome1) + len(genome2))
+    set1, set2 = set(genome1), set(genome2)
+    common = len(set1 & set2)
+    return (2.0 * common) / (len(genome1) + len(genome2))
+
+# Convert Synteny Index (SI) into a distance measure.
+def exactDistanceFromSyntenyIndex(genome1, genome2):
+    si = syntenyIndex(genome1, genome2)
+    return 1.0 - si
